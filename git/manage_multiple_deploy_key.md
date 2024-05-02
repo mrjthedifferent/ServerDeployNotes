@@ -1,16 +1,30 @@
+- Make Connection between Remote Server and Github via SSH Key
+- Generate SSH Keys
+```sh
+ssh-keygen -t ed25519 -C "your_email@example.com"
+```
+- If Permission Denied then Own .ssh then try again to Generate SSH Keys
+```sh
+Syntax:- sudo chown -R user_name .ssh
+Example:- sudo chown -R raj .ssh
+```
+
+
 In order to do that:
 
 First you should declare your different keys in ~/.ssh/config file.
 
 # Key for usual repositories on github.com
-```Host github.com
+```
+Host github.com
 HostName github.com
 User git
 IdentityFile ~/.ssh/id_rsa
 ```
 
 # Key for a particular repository on github.com
-```Host XXX
+```
+Host XXX
 HostName github.com
 User git
 IdentityFile ~/.ssh/id_other_rsa
