@@ -1,0 +1,19 @@
+sudo apt update
+sudo apt install clamav clamav-daemon -y
+
+# update database
+sudo freshclam
+
+# run scan
+clamscan -r /home
+
+# scan entire server
+sudo clamscan -r --bell -i /
+
+# automatically scan
+sudo systemctl enable clamav-daemon
+sudo systemctl start clamav-daemon
+
+# remove infected files
+sudo clamscan -r --remove /
+
