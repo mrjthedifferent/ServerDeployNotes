@@ -1,0 +1,143 @@
+name: CI/CD Pipeline
+
+on:
+  push:
+    branches: ["main"]
+  pull_request:
+    branches: ["main"]
+
+env:
+  NODE_VERSION: '20.11.1'
+  DEPLOYMENT_PATH: '/var/www/restaurants-order-site'
+
+jobs:
+  lint:
+    name: Code Quality Check
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: ${{ env.NODE_VERSION }}
+          cache: 'npm'
+          
+      - name: Install dependencies
+        run: npm ci
+        
+      - name: Run linting
+        run: npm run lint
+
+  build:
+    name: Build Application
+    needs: lint
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: ${{ env.NODE_VERSION }}
+          cache: 'npm'
+          
+      - name: Install dependencies
+        run: npm ci
+        
+      - name: Build application
+        run: npm run build
+        env:
+          NEXT_PUBLIC_GOOGLE_MAPS_API_KEY: ${{ secrets.NEXT_PUBLIC_GOOGLE_MAPS_API_KEY }}
+          SPED_BASE_URL: ${{ secrets.BASE_URL }}
+          NEXT_PUBLIC_SPED_BASE_URL: ${{ secrets.NEXT_PUBLIC_BASE_URL }}
+          
+      - name: Create deployment archive
+        run: |
+          # Install only production dependencies
+          npm ci --only=production
+          
+          # Create deployment archive with only necessary files
+          tar -czf deployment.tar.gz \
+            .next/ \
+            public/ \
+            node_modules/ \
+            package.json \
+            next.config.mjs \
+            ecosystem.config.cjs
+          
+      - name: Upload deployment archive
+        uses: actions/upload-artifact@v4
+        with:
+          name: deployment-archive
+          path: deployment.tar.gz
+          retention-days: 1
+
+  deploy:
+    name: Deploy to Production
+    needs: build
+    if: github.ref == 'refs/heads/main' && github.event_name == 'push'
+    runs-on: ubuntu-latest
+    steps:
+      - name: Download deployment archive
+        uses: actions/download-artifact@v4
+        with:
+          name: deployment-archive
+          
+      - name: Deploy to server
+        uses: appleboy/ssh-action@master
+        with:
+          host: ${{ secrets.SERVER }}
+          username: ${{ secrets.USER_NAME }}
+          password: ${{ secrets.PASSWORD }}
+          port: 22
+          script: |
+            # Create deployment directory
+            mkdir -p ${{ env.DEPLOYMENT_PATH }}
+            
+            # Stop application gracefully
+            cd ${{ env.DEPLOYMENT_PATH }} || exit 1
+            pm2 stop ecosystem.config.cjs 2>/dev/null || true
+            
+      - name: Transfer and extract files
+        uses: appleboy/scp-action@master
+        with:
+          host: ${{ secrets.SERVER }}
+          username: ${{ secrets.USER_NAME }}
+          password: ${{ secrets.PASSWORD }}
+          port: 22
+          source: "deployment.tar.gz"
+          target: "${{ env.DEPLOYMENT_PATH }}/"
+          
+      - name: Start application
+        uses: appleboy/ssh-action@master
+        with:
+          host: ${{ secrets.SERVER }}
+          username: ${{ secrets.USER_NAME }}
+          password: ${{ secrets.PASSWORD }}
+          port: 22
+          script: |
+            # Extract deployment archive
+            cd ${{ env.DEPLOYMENT_PATH }}
+            tar -xzf deployment.tar.gz
+            
+            # Set proper permissions
+            chown -R $USER:$USER ${{ env.DEPLOYMENT_PATH }}
+            chmod -R 755 ${{ env.DEPLOYMENT_PATH }}
+            
+            # Verify ecosystem.config.cjs exists
+            if [ ! -f "ecosystem.config.cjs" ]; then
+              echo "Error: ecosystem.config.cjs not found in ${{ env.DEPLOYMENT_PATH }}"
+              ls -la
+              exit 1
+            fi
+            
+            # Start application
+            pm2 start ecosystem.config.cjs --update-env || pm2 reload ecosystem.config.cjs --update-env
+            
+            # Clean up
+            rm -f deployment.tar.gz
+            
+            # Verify deployment
+            sleep 5
+            pm2 list | grep restaurants-order-site
