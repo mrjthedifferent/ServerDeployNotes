@@ -1,0 +1,152 @@
+name: CI/CD Pipeline
+
+on:
+  push:
+    branches: ["main"]
+  pull_request:
+    branches: ["main"]
+
+env:
+  # Node version
+  NODE_VERSION: '20.11.1'
+
+  # Deployment environment (production/staging/dev)
+  ENVIRONMENT: 'production'
+
+  # Application variables
+  APP_NAME: 'app-name'
+  APP_PORT: '3002'
+  DEPLOYMENT_PATH: '/var/www/app-name'
+
+  # .env content (dynamic and reusable)
+  ENV_CONTENT: |
+    NEXTAUTH_URL=http://localhost:${{ env.APP_PORT }}
+    NEXT_PUBLIC_GOOGLE_API_KEY=${{ secrets.NEXT_PUBLIC_GOOGLE_API_KEY }}
+    NEXT_PUBLIC_LOCATION_API_KEY=${{ secrets.NEXT_PUBLIC_LOCATION_API_KEY }}
+
+  # SSH/server secrets
+  SECRET_SSH_PRIVATE_KEY: ${{ secrets.SSH_PRIVATE_KEY }}
+  SECRET_SSH_PORT: ${{ secrets.SSH_PORT }}
+  SECRET_SERVER: ${{ secrets.SERVER }}
+  SECRET_USER_NAME: ${{ secrets.USER_NAME }}
+
+jobs:
+  lint:
+    name: Code Quality Check
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: ${{ env.NODE_VERSION }}
+      - run: npm install
+
+  build:
+    name: Build Application
+    needs: lint
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: ${{ env.NODE_VERSION }}
+      - run: npm install
+      - name: Create .env file
+        run: echo "${{ env.ENV_CONTENT }}" > .env
+      - name: Build application
+        run: npm run build
+        env:
+          NODE_ENV: ${{ env.ENVIRONMENT }}
+
+      - name: Create ecosystem.config.cjs dynamically
+        run: |
+          cat > ecosystem.config.cjs << 'EOL'
+          module.exports = {
+            apps: [
+              {
+                name: "${{ env.APP_NAME }}",
+                script: "npm",
+                args: "start",
+                env: {
+                  PORT: "${{ env.APP_PORT }}"
+                }
+              }
+            ]
+          }
+          EOL
+
+      - name: Create deployment archive
+        run: |
+          tar -czf deployment.tar.gz \
+            .next/ \
+            public/ \
+            package.json \
+            package-lock.json \
+            next.config.mjs \
+            ecosystem.config.cjs
+      - name: Upload deployment archive
+        uses: actions/upload-artifact@v4
+        with:
+          name: deployment-archive
+          path: deployment.tar.gz
+          retention-days: 3
+
+  deploy:
+    name: Deploy
+    needs: build
+    runs-on: ubuntu-latest
+    steps:
+      - name: Download deployment archive
+        uses: actions/download-artifact@v4
+        with:
+          name: deployment-archive
+
+      - name: Setup SSH key
+        run: |
+          mkdir -p ~/.ssh
+          echo "${{ env.SECRET_SSH_PRIVATE_KEY }}" > ~/.ssh/id_rsa
+          chmod 600 ~/.ssh/id_rsa
+          ssh-keyscan -p ${{ env.SECRET_SSH_PORT }} -H ${{ env.SECRET_SERVER }} >> ~/.ssh/known_hosts
+
+      - name: Deploy - Stop application
+        run: |
+          ssh -i ~/.ssh/id_rsa -p ${{ env.SECRET_SSH_PORT }} -o StrictHostKeyChecking=no ${{ env.SECRET_USER_NAME }}@${{ env.SECRET_SERVER }} << 'EOF'
+            APP_NAME=${{ env.APP_NAME }}
+            DEPLOY_PATH=${{ env.DEPLOYMENT_PATH }}
+            mkdir -p $DEPLOY_PATH
+            cd $DEPLOY_PATH
+            pm2 stop $APP_NAME 2>/dev/null || true
+          EOF
+
+      - name: Transfer files via SCP
+        run: |
+          scp -i ~/.ssh/id_rsa -P ${{ env.SECRET_SSH_PORT }} -o StrictHostKeyChecking=no deployment.tar.gz ${{ env.SECRET_USER_NAME }}@${{ env.SECRET_SERVER }}:${{ env.DEPLOYMENT_PATH }}/
+
+      - name: Deploy - Extract & Start
+        run: |
+          ssh -i ~/.ssh/id_rsa -p ${{ env.SECRET_SSH_PORT }} -o StrictHostKeyChecking=no ${{ env.SECRET_USER_NAME }}@${{ env.SECRET_SERVER }} << 'EOF'
+            APP_NAME=${{ env.APP_NAME }}
+            DEPLOY_PATH=${{ env.DEPLOYMENT_PATH }}
+            cd $DEPLOY_PATH
+            tar -xzf deployment.tar.gz
+            rm -f deployment.tar.gz
+
+            # Overwrite .env file with project-specific content
+            echo '${{ env.ENV_CONTENT }}' > .env
+
+            chown -R ${{ env.SECRET_USER_NAME }}:${{ env.SECRET_USER_NAME }} $DEPLOY_PATH
+            chmod -R 755 $DEPLOY_PATH
+
+            npm ci --production
+
+            if pm2 describe $APP_NAME > /dev/null 2>&1; then
+              pm2 reload $APP_NAME --update-env || pm2 restart $APP_NAME --update-env
+            else
+              pm2 start ecosystem.config.cjs --name $APP_NAME --update-env
+            fi
+
+            sleep 5
+            pm2 list | grep $APP_NAME || true
+          EOF
