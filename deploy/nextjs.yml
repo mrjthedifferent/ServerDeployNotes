@@ -1,0 +1,135 @@
+name: Deploy Next.js to Production
+
+on:
+  push:
+    branches: [main]
+
+env:
+  APP_NAME: nextjs-app
+  NODE_ENV: production
+  BRANCH: main
+  PORT: 3011
+
+  # Server Configuration
+  SERVER: ${{ secrets.PRD_SERVER }}
+  USERNAME: ${{ secrets.PRD_USERNAME }}
+  UPLOAD_PATH: ${{ secrets.PRD_UPLOAD_PATH }}
+  SSH_KEY: ${{ secrets.PRD_SSH_KEY }}
+  GIT_REPO: ${{ secrets.GIT_REPO }}
+
+jobs:
+  env:
+    name: 🔐 Create & Upload Environment File
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: 🔓 Setup SSH
+        uses: webfactory/ssh-agent@v0.9.0
+        with:
+          ssh-private-key: ${{ env.SSH_KEY }}
+
+      - name: 🔑 Add server to known hosts
+        run: ssh-keyscan -H ${{ env.SERVER }} >> ~/.ssh/known_hosts
+
+      - name: 📝 Create .env file dynamically
+        run: |
+          echo "🔐 Creating .env file..."
+          printf "NODE_ENV=production\n" > .env
+          printf "NEXT_PUBLIC_APP_NAME=%s\n" "${{ env.APP_NAME }}" >> .env
+
+          echo "✅ .env file created:"
+          cat .env
+
+      - name: 📤 Upload .env to server
+        run: |
+          echo "📤 Uploading .env to server..."
+          scp -o StrictHostKeyChecking=no .env ${{ env.USERNAME }}@${{ env.SERVER }}:${{ env.UPLOAD_PATH }}/.env
+          echo "✅ .env uploaded successfully!"
+
+  ecosystem:
+    name: ⚙️ Create & Upload PM2 Ecosystem File
+    runs-on: ubuntu-latest
+    needs: env
+
+    steps:
+      - name: 🔓 Setup SSH
+        uses: webfactory/ssh-agent@v0.9.0
+        with:
+          ssh-private-key: ${{ env.SSH_KEY }}
+
+      - name: 🔑 Add server to known hosts
+        run: ssh-keyscan -H ${{ env.SERVER }} >> ~/.ssh/known_hosts
+
+      - name: 🧱 Create PM2 ecosystem.config.js dynamically
+        run: |
+          echo "⚙️ Creating PM2 ecosystem.config.js..."
+          printf "module.exports = {\n" > ecosystem.config.js
+          printf "  apps: [{\n" >> ecosystem.config.js
+          printf "    name: '%s',\n" "${{ env.APP_NAME }}" >> ecosystem.config.js
+          printf "    script: 'node_modules/next/dist/bin/next',\n" >> ecosystem.config.js
+          printf "    args: 'start -p %s',\n" "${{ env.PORT }}" >> ecosystem.config.js
+          printf "    cwd: '%s',\n" "${{ env.UPLOAD_PATH }}" >> ecosystem.config.js
+          printf "    env: {\n" >> ecosystem.config.js
+          printf "      NODE_ENV: '%s'\n" "${{ env.NODE_ENV }}" >> ecosystem.config.js
+          printf "    }\n" >> ecosystem.config.js
+          printf "  }]\n" >> ecosystem.config.js
+          printf "};\n" >> ecosystem.config.js
+
+          echo "✅ ecosystem.config.js created:"
+          cat ecosystem.config.js
+
+      - name: 📤 Upload ecosystem.config.js to server
+        run: |
+          echo "📤 Uploading ecosystem.config.js to server..."
+          scp -o StrictHostKeyChecking=no ecosystem.config.js ${{ env.USERNAME }}@${{ env.SERVER }}:${{ env.UPLOAD_PATH }}/ecosystem.config.js
+          echo "✅ ecosystem.config.js uploaded successfully!"
+
+  deploy:
+    name: 🚀 Deploy Next.js App
+    runs-on: ubuntu-latest
+    needs: ecosystem
+
+    steps:
+      - name: 🔓 Setup SSH
+        uses: webfactory/ssh-agent@v0.9.0
+        with:
+          ssh-private-key: ${{ env.SSH_KEY }}
+
+      - name: 🔑 Add server to known hosts
+        run: ssh-keyscan -H ${{ env.SERVER }} >> ~/.ssh/known_hosts
+
+      - name: 🚀 Deploy and Build on Server
+        run: |
+          ssh -A ${{ env.USERNAME }}@${{ env.SERVER }} <<'EOF'
+            set -e
+            echo "🚀 Starting Next.js deployment..."
+
+            cd ${{ env.UPLOAD_PATH }}
+
+            export GIT_SSH_COMMAND="ssh -o StrictHostKeyChecking=no"
+            ssh-keyscan -H github.com >> ~/.ssh/known_hosts 2>/dev/null || true
+
+            if [ ! -d ".git" ]; then
+              echo "📁 Initializing repository..."
+              git init
+              git remote add origin ${{ env.GIT_REPO }}
+              git fetch --all
+              git reset --hard origin/${{ env.BRANCH }}
+            else
+              echo "📁 Updating repository..."
+              git fetch --all
+              git reset --hard origin/${{ env.BRANCH }}
+            fi
+
+            echo "📦 Installing dependencies..."
+            npm ci --ignore-scripts
+
+            echo "🏗️ Building Next.js app..."
+            npm run build
+
+            echo "🔁 Restarting app with PM2..."
+            pm2 startOrReload ecosystem.config.js --update-env
+            pm2 save
+
+            echo "✅ Deployment completed successfully!"
+          EOF
