@@ -1,0 +1,123 @@
+name: Deploy to Production
+
+on:
+  push:
+    branches: [main]
+
+env:
+  # Server Configuration
+  SERVER: ${{ secrets.PRD_SERVER }}
+  USERNAME: ${{ secrets.PRD_USERNAME }}
+  UPLOAD_PATH: ${{ secrets.PRD_UPLOAD_PATH }}
+  GIT_REPO: ${{ secrets.GIT_REPO }}
+  SSH_KEY: ${{ secrets.PRD_SSH_KEY }}
+  BYPASS_SECRET: ""
+
+  # Deployment Configuration
+  BRANCH: main
+
+jobs:
+  deploy:
+    name: Deploy to Server
+    runs-on: ubuntu-latest
+
+    steps:
+      # Step 1: Setup SSH for GitHub Actions to connect to your server
+      - name: Setup SSH
+        uses: webfactory/ssh-agent@v0.9.0
+        with:
+          ssh-private-key: ${{ env.SSH_KEY }}
+
+      # Step 2: Add server to known hosts to avoid interactive prompts
+      - name: Add server to known hosts
+        run: ssh-keyscan -H ${{ env.SERVER }} >> ~/.ssh/known_hosts
+
+      # Step 3: Deploy via Git on the server
+      - name: Deploy via Git
+        run: |
+          ssh -A ${{ env.USERNAME }}@${{ env.SERVER }} << 'EOF'
+            set -e
+            echo "🚀 Starting deployment..."
+
+            cd ${{ env.UPLOAD_PATH }}
+
+            # Configure Git to use SSH agent forwarding
+            export GIT_SSH_COMMAND="ssh -o StrictHostKeyChecking=no"
+
+            # Add GitHub to known hosts
+            ssh-keyscan -H github.com >> ~/.ssh/known_hosts 2>/dev/null || true
+
+            # Initialize repo if not exists
+            if [ ! -d ".git" ]; then
+              echo "📁 Initializing new repository..."
+              git init
+              git remote add origin ${{ env.GIT_REPO }}
+              git fetch --all
+              git reset --hard origin/${{ env.BRANCH }}
+            else
+              echo "📁 Updating existing repository..."
+              git fetch --all
+              git reset --hard origin/${{ env.BRANCH }}
+            fi
+
+            # Ensure storage and cache folders exist
+            mkdir -p bootstrap/cache
+            mkdir -p storage/framework/cache
+            mkdir -p storage/framework/sessions
+            mkdir -p storage/framework/views
+            mkdir -p storage/framework/cache/data
+
+            # Backup database before deployment
+            # php artisan backup:run --only-db --disable-notifications || echo "⚠️ Backup failed, continuing..."
+
+            # Run permission seeder
+            php artisan db:seed --class=PermissionSeeder
+
+            # Enable maintenance mode
+            BYPASS_SECRET="${{ env.BYPASS_SECRET }}"
+            if [ -n "$BYPASS_SECRET" ]; then
+              php artisan down --secret="$BYPASS_SECRET" || true
+            else
+              php artisan down || true
+            fi
+
+            # Install composer dependencies
+            echo "📦 Installing dependencies..."
+            composer install --optimize-autoloader --no-dev --no-interaction --prefer-dist
+
+            # Run database migrations
+            echo "🗄️ Running migrations..."
+            php artisan migrate --force
+
+            # Clear and rebuild caches
+            echo "🧹 Clearing and rebuilding caches..."
+            php artisan cache:clear
+            php artisan config:clear
+            php artisan route:clear
+            php artisan view:clear
+
+            php artisan config:cache
+            php artisan route:cache
+            php artisan view:cache
+
+            # Optional: reset permissions if needed (uncomment if you have permission issues)
+            # find storage -type f -exec chmod 644 {} \;
+            # find storage -type d -exec chmod 755 {} \;
+            # find bootstrap/cache -type f -exec chmod 644 {} \;
+            # find bootstrap/cache -type d -exec chmod 755 {} \;
+            # chown -R www-data:www-data storage bootstrap/cache 2>/dev/null || true
+
+            composer dump-autoload --optimize
+
+            # Bring the application back up
+            php artisan up
+
+            echo "✅ Deployment completed successfully!"
+          EOF
+
+      # Step 4: Health check to ensure the app is working
+      - name: Health check
+        run: |
+          echo "🔍 Performing health check..."
+          ssh ${{ env.USERNAME }}@${{ env.SERVER }} \
+            "cd ${{ env.UPLOAD_PATH }} && php artisan --version && echo '✅ Application is healthy'"
