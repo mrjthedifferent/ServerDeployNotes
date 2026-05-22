@@ -1,0 +1,57 @@
+upstream reverb_backend {
+    server 127.0.0.1:8090;
+    keepalive 64;
+}
+server {
+    server_name _;
+    root /var/www/_/public;
+
+    add_header X-Frame-Options "SAMEORIGIN";
+    add_header X-Content-Type-Options "nosniff";
+
+    index index.php;
+
+    charset utf-8;
+
+    location /app {
+    proxy_pass http://reverb_backend;
+    proxy_http_version 1.1;
+    proxy_set_header Upgrade $http_upgrade;
+    proxy_set_header Connection "upgrade";
+    proxy_set_header Host $host;
+    proxy_set_header X-Real-IP $remote_addr;
+    proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
+    proxy_set_header X-Forwarded-Proto $scheme;
+    proxy_read_timeout 86400;
+    }
+
+    location / {
+        try_files $uri $uri/ /index.php?$query_string;
+    }
+
+    location = /favicon.ico { access_log off; log_not_found off; }
+    location = /robots.txt  { access_log off; log_not_found off; }
+
+    error_page 404 /index.php;
+
+    location ~ ^/index\.php(/|$) {
+        fastcgi_pass unix:/var/run/php/php8.4-fpm.sock;
+        fastcgi_param SCRIPT_FILENAME $realpath_root$fastcgi_script_name;
+        include fastcgi_params;
+        fastcgi_hide_header X-Powered-By;
+        # Set timeouts
+        fastcgi_read_timeout 3600;
+        fastcgi_connect_timeout 3600;
+        fastcgi_send_timeout 3600;
+    }
+
+    location ~ /\.(?!well-known).* {
+        deny all;
+    }
+
+    # Increase timeout for other requests
+    proxy_read_timeout 3600;
+    proxy_send_timeout 3600;
+    keepalive_timeout 3600;
+    client_body_timeout 3600;
+}
